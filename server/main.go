@@ -113,6 +113,10 @@ func Shell() {
 			mode = true
 			continue
 		}
+		if command == "set Off" {
+			mode = false
+			continue
+		}
 		if mode == false {
 			if parts[0] == "command" {
 				var target Clients
