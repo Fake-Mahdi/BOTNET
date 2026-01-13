@@ -1,0 +1,233 @@
+package main
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"os"
+	"syscall"
+	"unsafe"
+
+	_ "modernc.org/sqlite"
+)
+
+// --- Added for DPAPI support ---
+var (
+	dllcrypt32  = syscall.NewLazyDLL("crypt32.dll")
+	procDecrypt = dllcrypt32.NewProc("CryptUnprotectData")
+)
+
+type dataBlob struct {
+	cbData uint32
+	pbData *byte
+}
+
+func cryptUnprotect(data []byte) ([]byte, error) {
+	var outBlob dataBlob
+	inBlob := dataBlob{cbData: uint32(len(data)), pbData: &data[0]}
+
+	// Calls Windows DPAPI to decrypt the master key
+	ret, _, err := procDecrypt.Call(
+		uintptr(unsafe.Pointer(&inBlob)),
+		0, 0, 0, 0, 0,
+		uintptr(unsafe.Pointer(&outBlob)),
+	)
+	if ret == 0 {
+		return nil, err
+	}
+	defer syscall.LocalFree(syscall.Handle(unsafe.Pointer(outBlob.pbData)))
+
+	// Create a Go slice from the C pointer
+	decrypted := make([]byte, outBlob.cbData)
+	copy(decrypted, unsafe.Slice(outBlob.pbData, outBlob.cbData))
+	return decrypted, nil
+}
+
+// ------------------------------
+
+type Config struct {
+	Mahdi MahdiConfig `json:"os_crypt"`
+}
+
+type MahdiConfig struct {
+	MahdiKey     string `json:"app_bound_encrypted_key"`
+	AuditEnabled bool   `json:"audit_enabled"`
+	EncryptedKey string `json:"encrypted_key"`
+}
+
+type DbInformation struct {
+	url           string
+	user          string
+	encryptedpass string
+}
+
+func getKey() []byte {
+	// Make sure "file.json" is the actual 'Local State' file from Chrome
+	file, err := os.ReadFile("file.json")
+	if err != nil {
+		panic(err)
+	}
+	var cfg Config
+	if err = json.Unmarshal(file, &cfg); err != nil {
+		panic(err)
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(cfg.Mahdi.EncryptedKey)
+	if err != nil {
+		panic(err)
+	}
+
+	// Remove 'DPAPI' prefix (first 5 bytes)
+	decoded = decoded[5:]
+
+	// NEW: Decrypt the decoded key using Windows DPAPI
+	masterKey, err := cryptUnprotect(decoded)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to decrypt master key: %v", err))
+	}
+
+	return masterKey
+}
+
+func decryptPassword(buff []byte, masterKey []byte) string {
+	if len(buff) < 15 {
+		return "Legacy/Unknown Format"
+	}
+
+	// 1. Extract the IV (Nonce) from index 3 to 15
+	iv := buff[3:15]
+	// 2. Extract the actual encrypted data
+	payload := buff[15:]
+
+	// 3. Create the AES cipher block
+	block, err := aes.NewCipher(masterKey)
+	if err != nil {
+		return "Error creating cipher"
+	}
+
+	// 4. Wrap the block in GCM mode
+	aesGCM, err := cipher.NewGCM(block)
+	if err != nil {
+		return "Error creating GCM"
+	}
+
+	// 5. Decrypt and Verify
+	plaintext, err := aesGCM.Open(nil, iv, payload, nil)
+	if err != nil {
+		return "Decryption failed (Check Master Key)"
+	}
+
+	return string(plaintext)
+}
+
+func main() {
+	// Ensure you copied the 'Login Data' file to './database' first
+	db, err := sql.Open("sqlite", "./database")
+	if err != nil {
+		fmt.Println("database connection problem")
+	}
+	defer db.Close()
+
+	rows, err2 := db.Query("SELECT origin_url, username_value, password_value FROM logins")
+	if err2 != nil {
+		fmt.Println("Error data quering")
+	}
+
+	masterkey := getKey()
+
+	for rows.Next() {
+		var data DbInformation
+		// Use local variables to scan since 'data' is overwritten each loop
+		var encryptedPassRaw []byte
+		err := rows.Scan(&data.url, &data.user, &encryptedPassRaw)
+		if err != nil {
+			fmt.Println(err)
+			continue
+		}
+
+		if data.user != "" && len(encryptedPassRaw) > 0 {
+			decryptedPassword := decryptPassword(encryptedPassRaw, masterkey)
+			fmt.Printf("URL: %s\nUser: %s\nPassword: %s\n\n", data.url, data.user, decryptedPassword)
+		}
+	}
+}
+
+
+
+
+
+
+
+
+
+import os
+import json
+import base64
+import sqlite3
+import shutil
+import win32crypt # pip install pypiwin32
+from Cryptodome.Cipher import AES # pip install pycryptodomex
+
+def get_master_key():
+    # 1. Path to the Local State file
+    local_state_path = os.path.join(os.environ["USERPROFILE"],
+        "AppData", "Local", "Google", "Chrome", "User Data", "Local State")
+    
+    with open(local_state_path, "r", encoding="utf-8") as f:
+        local_state = json.load(f)
+
+    # 2. Extract and Decrypt the Master Key using Windows DPAPI
+    encrypted_key = base64.b64decode(local_state["os_crypt"]["encrypted_key"])
+    encrypted_key = encrypted_key[5:]  # Remove 'DPAPI' prefix
+    master_key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+    return master_key
+
+def decrypt_password(buff, master_key):
+    try:
+        # Chrome passwords start with 'v10' or 'v11'
+        iv = buff[3:15]
+        payload = buff[15:]
+        
+        cipher = AES.new(master_key, AES.MODE_GCM, iv)
+        decrypted_pass = cipher.decrypt(payload)
+        
+        # Remove the 16-byte authentication tag from the end
+        decrypted_pass = decrypted_pass[:-16].decode()
+        return decrypted_pass
+    except Exception:
+        return "Legacy/Unknown Format"
+
+def main():
+    # 3. Define paths
+    master_key = get_master_key()
+    login_db = os.path.join(os.environ["USERPROFILE"], 
+        "AppData", "Local", "Google", "Chrome", "User Data", "Default", "Login Data")
+    
+    # Copy the DB so we don't interfere with Chrome if it's open
+    temp_db = "LoginDataCopy.db"
+    shutil.copyfile(login_db, temp_db)
+
+    # 4. Connect to the copied database
+    conn = sqlite3.connect(temp_db)
+    cursor = conn.cursor()
+    cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
+
+    print(f"{'URL':<50} | {'Username':<20} | {'Password'}")
+    print("-" * 100)
+
+    for row in cursor.fetchall():
+        url, user, encrypted_pass = row
+        if user:
+            decrypted_pass = decrypt_password(encrypted_pass, master_key)
+            print(f"{url:<50} | {user:<20} | {decrypted_pass}")
+
+    cursor.close()
+    conn.close()
+    os.remove(temp_db) # Clean up the temporary file
+
+if __name__ == "__main__":
+    main()
+
